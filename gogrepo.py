@@ -34,7 +34,7 @@ try:
     from Queue import Queue
     import cookielib as cookiejar
     from httplib import BadStatusLine
-    from urlparse import urlparse
+    from urlparse import urlparse,unquote
     from urllib import urlencode
     from urllib2 import HTTPError, URLError, HTTPCookieProcessor, build_opener, Request
 except ImportError:
@@ -42,7 +42,7 @@ except ImportError:
     from queue import Queue
     import http.cookiejar as cookiejar
     from http.client import BadStatusLine
-    from urllib.parse import urlparse, urlencode
+    from urllib.parse import urlparse, urlencode, unquote
     from urllib.request import HTTPCookieProcessor, HTTPError, URLError, build_opener, Request
 
 # python 2 / 3 renames
@@ -188,7 +188,7 @@ class AttrDict(dict):
 
     def __getattr__(self, key):
         return self[key]
-
+            
     def __setattr__(self, key, val):
         self[key] = val
 
@@ -316,7 +316,7 @@ def handle_game_updates(olditem, newitem):
 def fetch_file_info(d, fetch_md5):
     # fetch file name/size
     with request(d.href, byte_range=(0, 0)) as page:
-        d.name = urlparse(page.geturl()).path.split('/')[-1]
+        d.name = unquote(urlparse(page.geturl()).path.split('/')[-1])
         d.size = int(page.headers['Content-Range'].split('/')[-1])
 
         # fetch file md5
@@ -386,7 +386,7 @@ def filter_extras(out_list, extras_list):
                      href=GOG_HOME_URL + extra['manualUrl'],
                      md5=None,
                      name=None,
-                     size=None,
+                     size=None
                      )
         try:
             fetch_file_info(d, False)
@@ -1059,7 +1059,7 @@ def cmd_verify(gamedir, check_md5, check_filesize, check_zips, delete_on_fail, i
             if itm.name is None:
                 warn('no known filename for "%s (%s)"' % (game.title, itm.desc))
                 continue
-
+                
             item_count += 1
 
             itm_dirpath = os.path.join(game.title, itm.name)
@@ -1083,6 +1083,7 @@ def cmd_verify(gamedir, check_md5, check_filesize, check_zips, delete_on_fail, i
                     if not test_zipfile(itm_file):
                         info('zip test failed for %s' % itm_dirpath)
                         bad_zip_cnt += 1
+                        fail = True
                 if delete_on_fail and fail:
                     info('deleting %s' % itm_dirpath)
                     os.remove(itm_file)
