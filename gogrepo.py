@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
+
 from __future__ import print_function
 from __future__ import division
 
@@ -29,6 +30,8 @@ import socket
 import xml.etree.ElementTree
 import copy
 # python 2 / 3 imports
+import requests 
+import re
 try:
     # python 2
     from Queue import Queue
@@ -102,6 +105,7 @@ HTTP_RETRY_DELAY = 5   # in seconds
 HTTP_RETRY_COUNT = 3
 HTTP_GAME_DOWNLOADER_THREADS = 4
 HTTP_PERM_ERRORCODES = (404, 403, 503)
+USER_AGENT = 'GOGRepoK/' + str(__version__)
 
 # Save manifest data for these os and lang combinations
 DEFAULT_OS_LIST = ['windows']
@@ -146,6 +150,36 @@ ORPHAN_DIR_NAME = '!orphaned'
 ORPHAN_DIR_EXCLUDE_LIST = [ORPHAN_DIR_NAME, '!misc']
 ORPHAN_FILE_EXCLUDE_LIST = [INFO_FILENAME, SERIAL_FILENAME]
 
+#temporary request wrapper while testing sessions module in context of update. Will replace request when complete
+def update_request(session,url,args=None,byte_range=None,retries=HTTP_RETRY_COUNT,delay=None):
+    """Performs web request to url with optional retries, delay, and byte range.
+    """
+    _retry = False
+    if delay is not None:
+        time.sleep(delay)
+
+    try:
+        if byte_range is not None:  
+            response = session.get(url, params=args, headers= {'Range':'bytes=%d-%d' % byte_range})
+        else:
+            response = session.get(url, params=args)
+        response.raise_for_status()    
+    except (requests.HTTPError, requests.URLRequired, requests.Timeout,requests.ConnectionError) as e:
+        if isinstance(e, requests.HTTPError):
+            if e.response.status_code in HTTP_PERM_ERRORCODES:  # do not retry these HTTP codes
+                warn('request failed: %s.  will not retry.', e)
+                raise
+        if retries > 0:
+            _retry = True
+        else:
+            raise
+
+        if _retry:
+            warn('request failed: %s (%d retries left) -- will retry in %ds...' % (e, retries, HTTP_RETRY_DELAY))
+            return update_request(session=session,url=url, args=args, byte_range=byte_range, retries=retries-1, delay=HTTP_RETRY_DELAY)
+    return response
+    
+
 def request(url, args=None, byte_range=None, retries=HTTP_RETRY_COUNT, delay=HTTP_FETCH_DELAY):
     """Performs web request to url with optional retries, delay, and byte range.
     """
@@ -170,7 +204,7 @@ def request(url, args=None, byte_range=None, retries=HTTP_RETRY_COUNT, delay=HTT
         if retries > 0:
             _retry = True
         else:
-            raise
+            raise 
 
         if _retry:
             warn('request failed: %s (%d retries left) -- will retry in %ds...' % (e, retries, HTTP_RETRY_DELAY))
@@ -187,7 +221,10 @@ class AttrDict(dict):
         self.update(kw)
 
     def __getattr__(self, key):
-        return self[key]
+        try:
+            return self[key]
+        except KeyError:
+            raise AttributeError(key)
             
     def __setattr__(self, key, val):
         self[key] = val
@@ -221,6 +258,8 @@ def load_manifest(filepath=MANIFEST_FILENAME):
     try:
         with codecs.open(MANIFEST_FILENAME, 'rU', 'utf-8') as r:
             ad = r.read().replace('{', 'AttrDict(**{').replace('}', '})')
+            if (sys.version_info[0] >= 3):
+                ad = re.sub(r"'size': ([0-9]+)L,",r"'size': \1,",ad)
         return eval(ad)
     except IOError:
         return []
@@ -311,32 +350,32 @@ def handle_game_updates(olditem, newitem):
 
     if olditem.serial != newitem.serial:
         info('  -> serial key has changed')
-
-
-def fetch_file_info(d, fetch_md5):
+                
+                            
+def fetch_file_info(d, fetch_md5, updateSession):
     # fetch file name/size
-    with request(d.href, byte_range=(0, 0)) as page:
-        d.name = unquote(urlparse(page.geturl()).path.split('/')[-1])
-        d.size = int(page.headers['Content-Range'].split('/')[-1])
+    response = update_request(updateSession, d.href, byte_range=(0, 0))
+    d.name = unquote(urlparse(response.url).path.split('/')[-1])
+    d.size = int(response.headers['Content-Range'].split('/')[-1])
 
-        # fetch file md5
-        if fetch_md5:
-            if os.path.splitext(page.geturl())[1].lower() not in SKIP_MD5_FILE_EXT:
-                tmp_md5_url = page.geturl().replace('?', '.xml?')
-                try:
-                    with request(tmp_md5_url) as page:
-                        shelf_etree = xml.etree.ElementTree.parse(page).getroot()
-                        d.md5 = shelf_etree.attrib['md5']
-                except HTTPError as e:
-                    if e.code == 404:
-                        warn("no md5 data found for {}".format(d.name))
-                    else:
-                        raise
-                except xml.etree.ElementTree.ParseError:
-                    warn('xml parsing error occurred trying to get md5 data for {}'.format(d.name))
+    # fetch file md5
+    if fetch_md5:
+        if os.path.splitext(response.url)[1].lower() not in SKIP_MD5_FILE_EXT:
+            tmp_md5_url = response.url.replace('?', '.xml?')
+            try:
+                md5_response = update_request(updateSession, tmp_md5_url)
+                shelf_etree = xml.etree.ElementTree.fromstring(md5_response.content)
+                d.md5 = shelf_etree.attrib['md5']
+            except requests.HTTPError as e:
+                if e.response.status_code == 404:
+                    warn("no md5 data found for {}".format(d.name))
+                else:
+                    raise
+            except xml.etree.ElementTree.ParseError:
+                warn('xml parsing error occurred trying to get md5 data for {}'.format(d.name))
 
 
-def filter_downloads(out_list, downloads_list, lang_list, os_list):
+def filter_downloads(out_list, downloads_list, lang_list, os_list, updateSession):
     """filters any downloads information against matching lang and os, translates
     them, and extends them into out_list
     """
@@ -365,15 +404,15 @@ def filter_downloads(out_list, downloads_list, lang_list, os_list):
                                      size=None
                                      )
                         try:
-                            fetch_file_info(d, True)
-                        except HTTPError:
+                            fetch_file_info(d, True, updateSession)
+                        except requests.HTTPError:
                             warn("failed to fetch %s" % d.href)
                         filtered_downloads.append(d)
 
     out_list.extend(filtered_downloads)
 
 
-def filter_extras(out_list, extras_list):
+def filter_extras(out_list, extras_list, updateSession):
     """filters and translates extras information and adds them into out_list
     """
     filtered_extras = []
@@ -389,24 +428,24 @@ def filter_extras(out_list, extras_list):
                      size=None
                      )
         try:
-            fetch_file_info(d, False)
-        except HTTPError:
+            fetch_file_info(d, False, updateSession)
+        except requests.HTTPError:
             warn("failed to fetch %s" % d.href)
         filtered_extras.append(d)
 
     out_list.extend(filtered_extras)
 
 
-def filter_dlcs(item, dlc_list, lang_list, os_list):
+def filter_dlcs(item, dlc_list, lang_list, os_list, updateSession):
     """filters any downloads/extras information against matching lang and os, translates
     them, and adds them to the item downloads/extras
 
     dlcs can contain dlcs in a recursive fashion, and oddly GOG does do this for some titles.
     """
     for dlc_dict in dlc_list:
-        filter_downloads(item.downloads, dlc_dict['downloads'], lang_list, os_list)
-        filter_extras(item.extras, dlc_dict['extras'])
-        filter_dlcs(item, dlc_dict['dlcs'], lang_list, os_list)  # recursive
+        filter_downloads(item.downloads, dlc_dict['downloads'], lang_list, os_list, updateSession)
+        filter_extras(item.extras, dlc_dict['extras'], updateSession)
+        filter_dlcs(item, dlc_dict['dlcs'], lang_list, os_list, updateSession)  # recursive
         
 def deDuplicateList(duplicatedList,existingItems):   
     deDuplicatedList = []
@@ -613,20 +652,33 @@ def cmd_login(user, passwd):
         error('login failed, verify your username/password and try again.')
 
 
+def makeGOGSession():
+    gogSession = requests.Session()
+    gogSession.headers={'User-Agent':USER_AGENT}
+    load_cookies()
+    gogSession.cookies.update(global_cookies)
+    return gogSession
+
+
 def cmd_update(os_list, lang_list, skipknown, updateonly, id):
+    updateSession = requests.Session()
+    updateSession.headers={'User-Agent':USER_AGENT}
     media_type = GOG_MEDIA_TYPE_GAME
     items = []
     item_count = 0
     known_ids = []
     i = 0
-
+    
     load_cookies()
+    updateSession.cookies.update(global_cookies)
 
     gamesdb = load_manifest()
 
     api_url  = GOG_ACCOUNT_URL
     api_url += "/getFilteredProducts"
-
+    updateSession = makeGOGSession()
+    
+    
     # Make convenient list of known ids
     if skipknown:
         for item in gamesdb:
@@ -640,47 +692,44 @@ def cmd_update(os_list, lang_list, skipknown, updateonly, id):
             info('fetching game product data (page %d)...' % i)
         else:
             info('fetching game product data (page %d / %d)...' % (i, json_data['totalPages']))
-        with request(api_url, args={'mediaType': media_type,
-                                    'sortBy': 'title',  # sort order
-                                    'page': str(i)}, delay=0) as data_request:
-            reader = codecs.getreader("utf-8")
-            try:
-                json_data = json.load(reader(data_request))
-            except ValueError:
-                error('failed to load product data (are you still logged in?)')
-                raise SystemExit(1)
+        data_response = update_request(updateSession, api_url, args={'mediaType': media_type, 'sortBy': 'title', 'page': str(i)})    
+        try:
+            json_data = data_response.json()
+        except ValueError:
+            error('failed to load product data (are you still logged in?)')
+            raise SystemExit(1)
 
-            # Parse out the interesting fields and add to items dict
-            for item_json_data in json_data['products']:
-                item_count += 1
+        # Parse out the interesting fields and add to items dict
+        for item_json_data in json_data['products']:
+            item_count += 1
 
-                item = AttrDict()
-                item.id = item_json_data['id']
-                item.title = item_json_data['slug']
-                item.long_title = item_json_data['title']
-                item.genre = item_json_data['category']
-                item.image_url = item_json_data['image']
-                item.store_url = item_json_data['url']
-                item.media_type = media_type
-                item.rating = item_json_data['rating']
-                item.has_updates = bool(item_json_data['updates'])
+            item = AttrDict()
+            item.id = item_json_data['id']
+            item.title = item_json_data['slug']
+            item.long_title = item_json_data['title']
+            item.genre = item_json_data['category']
+            item.image_url = item_json_data['image']
+            item.store_url = item_json_data['url']
+            item.media_type = media_type
+            item.rating = item_json_data['rating']
+            item.has_updates = bool(item_json_data['updates'])
 
-                if id:
-                    if item.title == id or str(item.id) == id:  # support by game title or gog id
-                        info('found "{}" in product data!'.format(item.title))
-                        items.append(item)
-                        done = True
-                elif updateonly:
-                    if item.has_updates:
-                        items.append(item)
-                elif skipknown:
-                    if item.id not in known_ids:
-                        items.append(item)
-                else:
+            if id:
+                if item.title == id or str(item.id) == id:  # support by game title or gog id
+                    info('found "{}" in product data!'.format(item.title))
                     items.append(item)
+                    done = True
+            elif updateonly:
+                if item.has_updates:
+                    items.append(item)
+            elif skipknown:
+                if item.id not in known_ids:
+                    items.append(item)
+            else:
+                items.append(item)
 
-            if i >= json_data['totalPages']:
-                done = True
+        if i >= json_data['totalPages']:
+            done = True
 
     # bail if there's nothing to do
     if len(items) == 0:
@@ -704,40 +753,39 @@ def cmd_update(os_list, lang_list, skipknown, updateonly, id):
     for item in sorted(items, key=lambda item: item.title):
         api_url  = GOG_ACCOUNT_URL
         api_url += "/gameDetails/{}.json".format(item.id)
-
+        
         i += 1
         info("(%*d / %d) fetching game details for %s..." % (print_padding, i, items_count, item.title))
 
         try:
-            with request(api_url) as data_request:
-                reader = codecs.getreader("utf-8")
-                item_json_data = json.load(reader(data_request))
+            response = update_request(updateSession,api_url)
+            item_json_data = response.json()
 
-                item.bg_url = item_json_data['backgroundImage']
-                item.serial = item_json_data['cdKey']
-                item.forum_url = item_json_data['forumLink']
-                item.changelog = item_json_data['changelog']
-                item.release_timestamp = item_json_data['releaseTimestamp']
-                item.gog_messages = item_json_data['messages']
-                item.downloads = []
-                item.extras = []
+            item.bg_url = item_json_data['backgroundImage']
+            item.serial = item_json_data['cdKey']
+            item.forum_url = item_json_data['forumLink']
+            item.changelog = item_json_data['changelog']
+            item.release_timestamp = item_json_data['releaseTimestamp']
+            item.gog_messages = item_json_data['messages']
+            item.downloads = []
+            item.extras = []
 
-                # parse json data for downloads/extras/dlcs
-                filter_downloads(item.downloads, item_json_data['downloads'], lang_list, os_list)
-                filter_extras(item.extras, item_json_data['extras'])
-                filter_dlcs(item, item_json_data['dlcs'], lang_list, os_list)
+            # parse json data for downloads/extras/dlcs
+            filter_downloads(item.downloads, item_json_data['downloads'], lang_list, os_list, updateSession)
+            filter_extras(item.extras, item_json_data['extras'], updateSession)
+            filter_dlcs(item, item_json_data['dlcs'], lang_list, os_list, updateSession)
                 
-                existingItems = {}                
-                item.downloads = deDuplicateList(item.downloads,existingItems)  
-                item.extras = deDuplicateList(item.extras,existingItems)
+            existingItems = {}                
+            item.downloads = deDuplicateList(item.downloads,existingItems)  
+            item.extras = deDuplicateList(item.extras,existingItems)
 
-                # update gamesdb with new item
-                item_idx = item_checkdb(item.id, gamesdb)
-                if item_idx is not None:
-                    handle_game_updates(gamesdb[item_idx], item)
-                    gamesdb[item_idx] = item
-                else:
-                    gamesdb.append(item)
+            # update gamesdb with new item
+            item_idx = item_checkdb(item.id, gamesdb)
+            if item_idx is not None:
+                handle_game_updates(gamesdb[item_idx], item)
+                gamesdb[item_idx] = item
+            else:
+                gamesdb.append(item)
 
         except Exception:
             log_exception('error')
@@ -908,7 +956,7 @@ def cmd_download(savedir, skipextras, skipgames, dryrun, id):
     if dryrun:
         info("{} left to download".format(gigs(sum(sizes.values()))))
         return  # bail, as below just kicks off the actual downloading
-
+        
     info('-'*60)
 
     # work item I/O loop
@@ -935,7 +983,7 @@ def cmd_download(savedir, skipextras, skipgames, dryrun, id):
                         os.makedirs(dest_dir)
                     if os.path.exists(path) and os.path.getsize(path) > sz:  # if needed, truncate file if ours is larger than expected size
                         with open_notrunc(path) as f:
-                            f.truncate(sz)
+                                    f.truncate(sz)
                 with open_notrunc(path) as out:
                     out.seek(start)
                     se = start, end
@@ -993,7 +1041,7 @@ def cmd_download(savedir, skipextras, skipgames, dryrun, id):
         with lock:
             log_exception('')
         raise
-
+        
 
 def cmd_backup(src_dir, dest_dir):
     gamesdb = load_manifest()
@@ -1066,8 +1114,8 @@ def cmd_verify(gamedir, check_md5, check_filesize, check_zips, delete_on_fail, i
             itm_file = os.path.join(gamedir, game.title, itm.name)
 
             if os.path.isfile(itm_file):
-                info('verifying %s...' % itm_dirpath)
-
+                info('verifying %s...' % itm_dirpath)  
+                
                 fail = False
                 if check_md5 and itm.md5 is not None:
                     if itm.md5 != hashfile(itm_file):
@@ -1091,7 +1139,7 @@ def cmd_verify(gamedir, check_md5, check_filesize, check_zips, delete_on_fail, i
             else:
                 info('missing file %s' % itm_dirpath)
                 missing_cnt += 1
-
+        
     info('')
     info('--totals------------')
     info('known items......... %d' % item_count)
